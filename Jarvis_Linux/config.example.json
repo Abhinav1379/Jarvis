@@ -12,13 +12,16 @@
     "tts_backend": "auto",
     "tts_rate": 170,
     "tts_voice": "en",
+    "piper_binary": "piper",
     "piper_model": "",
     "stt_backend": "google",
     "language": "en-US",
     "vosk_model_path": "",
+    "whisper_model": "base.en",
     "wake_word": "jarvis",
     "require_wake_word": true,
-    "mic_device_index": -1
+    "mic_device_index": -1,
+    "phrase_time_limit": 8
   },
   "apps": {
     "aliases": {
@@ -61,6 +64,7 @@
     "battery_high": 0,
     "ram_high": 90,
     "cpu_high": 95,
+    "cpu_sustain_checks": 3,
     "disk_low_free_pct": 10,
     "disk_paths": [
       "/",
