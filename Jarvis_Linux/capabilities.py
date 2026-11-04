@@ -16,6 +16,7 @@ import fnmatch
 import logging
 import os
 import re
+import shlex
 import shutil
 import socket
 import threading
@@ -72,8 +73,11 @@ def score_app(query: str, e: AppEntry) -> float:
     stem_last = stem.split(".")[-1] if stem else ""
     exec0 = ""
     if e.exec:
-        first = e.exec.split()[0] if e.exec.split() else ""
-        exec0 = os.path.basename(first.strip('"')).lower()
+        try:
+            argv = shlex.split(e.exec)
+            exec0 = os.path.basename(argv[0]).lower() if argv else ""
+        except ValueError:
+            pass
     if q in (name, exec0, stem, stem_last):
         return 1.0
     if name.startswith(q) or (exec0 and exec0.startswith(q)):
@@ -130,23 +134,30 @@ class AppLauncher:
             chosen = self.platform.default_app(category, index) or next(
                 (e for e in index if category in e.categories), None)
         if chosen is None:
-            scored = sorted(((score_app(q, e), e) for e in index), key=lambda t: t[0], reverse=True)
-            scored = [(s, e) for s, e in scored if s >= self.MIN_SCORE]
-            if scored:
+            scored = []
+            for entry in index:
+                score = score_app(q, entry)
+                if score == 1.0:  # No later entry can outrank the first perfect match.
+                    chosen = entry
+                    break
+                if score >= self.MIN_SCORE:
+                    scored.append((score, entry))
+            if chosen is None and scored:
+                scored.sort(key=lambda t: t[0], reverse=True)
                 top = scored[0][0]
                 close, names = [], set()
                 for s, e in scored:
                     if top - s <= 0.05 and _norm(e.name) not in names:
                         names.add(_norm(e.name))
                         close.append(e)
-                if top >= 0.99 or len(close) == 1:
+                if len(close) == 1:
                     chosen = scored[0][1]
                 else:
                     return "ambiguous", close[:4]
         if chosen is None and self.settings.get("apps.allow_path_fallback") and re.fullmatch(r"[\w.+-]+", q):
             path = self.platform.which(q)
             if path:
-                chosen = AppEntry(name=q, exec=path, source="path")
+                chosen = AppEntry(name=q, exec=shlex.quote(path), source="path")
         if chosen is None:
             return "none", None
         reason = self.blocked_reason(chosen)
@@ -219,18 +230,24 @@ class FileSearch:
         return tier, path.count(os.sep), -mtime
 
     def _allowed(self, path: str, roots: list[Path], hidden: bool) -> bool:
-        if not any(path == str(r) or path.startswith(str(r).rstrip(os.sep) + os.sep) for r in roots):
-            return False
-        parts = Path(path).parts
         excl = set(self.settings.get("files.exclude_dirs") or [])
-        if any(p in excl for p in parts):
-            return False
-        return hidden or not any(p.startswith(".") for p in parts)
+        for root in roots:
+            try:
+                parts = Path(path).relative_to(root).parts
+            except ValueError:
+                continue
+            if ".." in parts or any(p in excl for p in parts[:-1]):
+                continue
+            if parts and parts[-1] in excl and os.path.isdir(path):
+                continue
+            if hidden or not any(p.startswith(".") for p in parts):
+                return True
+        return False
 
     def _walk(self, match, kind: str, roots: list[Path], hidden: bool, cap: int) -> tuple[list[str], bool]:
         """Iterative, depth- and time-bounded scandir walk. Never follows symlinked dirs."""
         excl = set(self.settings.get("files.exclude_dirs") or [])
-        max_depth = int(self.settings.get("files.max_depth") or 10)
+        max_depth = int(self.settings.get("files.max_depth"))
         deadline = time.monotonic() + float(self.settings.get("files.time_budget_s") or 4.0)
         found, truncated = [], False
         stack = [(r, 0) for r in reversed(roots)]
@@ -241,22 +258,25 @@ class FileSearch:
             d, depth = stack.pop()
             try:
                 with os.scandir(d) as it:
-                    entries = list(it)
+                    for e in it:
+                        if time.monotonic() > deadline:
+                            return found, True
+                        if not hidden and e.name.startswith("."):
+                            continue
+                        try:
+                            is_dir = e.is_dir(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if is_dir and e.name in excl:
+                            continue
+                        if match(e.name) and (kind == "any" or (kind == "dir") == is_dir):
+                            found.append(e.path)
+                            if len(found) >= cap:
+                                return found, True
+                        if is_dir and depth < max_depth:
+                            stack.append((e.path, depth + 1))
             except OSError:
                 continue
-            for e in entries:
-                if not hidden and e.name.startswith("."):
-                    continue
-                try:
-                    is_dir = e.is_dir(follow_symlinks=False)
-                except OSError:
-                    continue
-                if match(e.name) and (kind == "any" or (kind == "dir") == is_dir):
-                    found.append(e.path)
-                    if len(found) >= cap:
-                        return found, True
-                if is_dir and e.name not in excl and depth < max_depth:
-                    stack.append((e.path, depth + 1))
         return found, truncated
 
     def search(self, query: str, kind: str = "any", root: Path | None = None, exts: tuple = ()) -> dict:
@@ -264,7 +284,7 @@ class FileSearch:
         if not query:
             return fail("Search for what?", error="empty query")
         roots = [root] if root else [Path(r).expanduser() for r in self.settings.get("files.search_roots") or ["~"]]
-        roots = [r.resolve() for r in roots if r.is_dir()]
+        roots = list(dict.fromkeys(r.resolve() for r in roots if r.is_dir()))
         if not roots:
             return fail("None of the search folders exist.", error="no roots")
         hidden = bool(self.settings.get("files.include_hidden"))
@@ -275,28 +295,37 @@ class FileSearch:
         found: list[str] | None = None
         truncated = False
         if self.settings.get("files.use_locate") and not any(c in query for c in "*?["):
-            hits = self.platform.locate(query.split()[0])
+            try:
+                hits = self.platform.locate(query.split()[0])
+            except Exception:
+                log.exception("locate failed; falling back to file walk")
+                hits = None
             if hits:     # empty/None -> db missing or stale; walk instead
                 found = [h for h in hits if match(os.path.basename(h)) and self._allowed(h, roots, hidden)
                          and os.path.exists(h) and (kind == "any" or (kind == "dir") == os.path.isdir(h))]
                 found = found or None
         if found is None:
             found, truncated = self._walk(match, kind, roots, hidden, cap=limit * 20)
+        found = list(dict.fromkeys(found))
         found.sort(key=lambda p: self._rank(query, p))
+        truncated = truncated or len(found) > limit
         found = found[:limit]
         if not found:
             where = ", ".join(str(r) for r in roots)
+            if truncated:
+                return fail(f"Search stopped early without a match for '{query}'. Narrow it down or add 'in <folder>'.",
+                            error="search limit", results=[], truncated=True)
             return fail(f"No {'folders' if kind == 'dir' else 'files'} matching '{query}' under {where}.",
                         error="not_found", results=[])
         home = str(Path.home())
         lines = [f"  {i}. {p.replace(home, '~', 1)}{'/' if os.path.isdir(p) else ''}"
                  for i, p in enumerate(found, 1)]
-        note = "\n  (search stopped early — narrow it down or add 'in <folder>')" if truncated else ""
+        note = "\n  (results limited — narrow it down or add 'in <folder>')" if truncated else ""
         names = ", ".join(os.path.basename(p) for p in found[:3])
         speech = (f"Found {os.path.basename(found[0])}." if len(found) == 1
                   else f"Found {len(found)} matches. Top ones: {names}.")
         return ok(f"Found {len(found)} match{'es' * (len(found) != 1)}:\n" + "\n".join(lines) + note
-                  + "\n  Say 'open 1' to open one.", speech=speech, results=found)
+                  + "\n  Say 'open 1' to open one.", speech=speech, results=found, truncated=truncated)
 
 
 # ── system information ─────────────────────────────────────────────────────
@@ -340,8 +369,8 @@ class SystemMonitor:
                 dev = p.stat().st_dev
                 if dev in seen:
                     continue
-                seen.add(dev)
                 u = shutil.disk_usage(p)
+                seen.add(dev)
             except OSError as e:
                 log.info("disk_usage %s: %s", p, e)
                 continue
@@ -359,7 +388,7 @@ class SystemMonitor:
         if not b:
             return ok("No battery detected — this looks like a desktop or VM.", speech="No battery detected.",
                       present=False)
-        state = "charging" if b["charging"] else "on battery"
+        state = "plugged in" if b.get("plugged_in") or b["charging"] else "on battery"
         left = f", about {fmt_duration(b['seconds_left'])} left" if b.get("seconds_left") else ""
         return ok(f"Battery {b['percent']}% ({b['status'].lower()}, {state}{left}).",
                   speech=f"Battery is at {b['percent']} percent, {state}.", present=True, **b)
@@ -388,15 +417,21 @@ class SystemMonitor:
                   processes=procs)
 
     def summary(self) -> dict:
-        parts, speech = [], []
-        for fn in (self.cpu, self.memory, self.disk, self.battery, self.uptime):
-            r = fn()
-            if r["ok"] and not (fn == self.battery and not r.get("data", {}).get("present")):
-                parts.append(r["text"].split("\n")[0])
+        parts, speech, readings, missing = [], [], {}, []
+        for name in ("cpu", "memory", "disk", "battery", "uptime", "temperatures"):
+            r = getattr(self, name)()
+            readings[name] = r.get("data", {})
+            if r["ok"] and not (name == "battery" and not r.get("data", {}).get("present")):
+                parts.append(r["text"])
                 speech.append(r.get("speech") or r["text"])
-        if not parts:
+            elif not r["ok"]:
+                missing.append(name)
+        if not any(v for k, v in readings.items() if k != "battery") and not readings["battery"].get("present"):
             return fail("System information isn't available on this platform.", error="unavailable")
-        return ok("\n".join(f"  {p}" for p in parts), speech=" ".join(speech[:3]))
+        if missing:
+            parts.append("Unavailable: " + ", ".join(missing) + ".")
+        return ok("\n".join(f"  {p}" for p in parts), speech=" ".join(speech[:3]),
+                  readings=readings, unavailable=missing)
 
     def snapshot(self) -> dict:
         cpu = self._safe(self.platform.cpu_stats) or {}
@@ -404,7 +439,8 @@ class SystemMonitor:
         bat = self._safe(self.platform.battery)
         d = self.disk().get("data", {}).get("disks", [])
         return {"cpu": cpu.get("percent"), "ram": mem.get("percent"),
-                "battery": (bat["percent"], bat["charging"]) if bat else None,
+                "battery": (bat["percent"], bool(bat.get("status") != "Discharging" and
+                            (bat.get("plugged_in") or bat.get("charging")))) if bat else None,
                 "disk": [(r["path"], r["free_pct"]) for r in d]}
 
 
@@ -458,7 +494,11 @@ class Network:
         else:
             ip = self.primary_ip()
             lines.append(f"  Local IP: {ip or 'unknown'}")
-        gw = self.platform.default_gateway()
+        try:
+            gw = self.platform.default_gateway()
+        except Exception:
+            log.exception("default_gateway failed")
+            gw = None
         if gw:
             lines.append(f"  Gateway: {gw}")
         wifi = self._safe_wifi()
@@ -489,6 +529,9 @@ class Network:
             sig = f", signal {w['signal']}%" if w.get("signal") is not None else ""
             sec = f", {w['security']}" if w.get("security") else ""
             return ok(f"Connected to {w['ssid']}{sig}{sec}.", speech=f"Connected to {w['ssid']}.", **w)
+        if w.get("enabled") is None:
+            return fail("Wi-Fi adapter detected, but its status is unavailable. Check your network service "
+                        "or try 'network status'.", error="status unavailable", **w)
         return ok("Wi-Fi is on but not connected to a network.", **w)
 
     def set_wifi(self, enabled: bool) -> dict:
@@ -584,8 +627,14 @@ class BackgroundMonitor:
                 self.active -= {"battery_low", "battery_critical"}
                 if high and pct >= high and self._enter("battery_high"):
                     alerts.append(("battery_high", f"Battery at {pct}% — you can unplug.", "low"))
+                elif not high or pct < high - 2:
+                    self.active.discard("battery_high")
             else:
                 self.active.discard("battery_high")
+                if pct > low + 2:
+                    self.active -= {"battery_low", "battery_critical"}
+                elif pct > crit + 2:
+                    self.active.discard("battery_critical")
                 if pct <= crit and self._enter("battery_critical"):
                     self.active.add("battery_low")
                     alerts.append(("battery_critical", f"Battery critical: {pct}%. Plug in now.", "critical"))
@@ -606,6 +655,8 @@ class BackgroundMonitor:
                 alerts.append(("cpu_high", f"CPU has been above {limit:.0f}% for a while.", "normal"))
             elif cpu < limit - 10:
                 self.active.discard("cpu_high")
+        else:
+            self._cpu_streak = 0
         low_free = float(g("monitor.disk_low_free_pct"))
         for path, free_pct in snap.get("disk") or []:
             key = f"disk_low:{path}"
@@ -633,12 +684,21 @@ class BackgroundMonitor:
 
     def start(self) -> dict:
         if self.running:
+            if self._stop.is_set():
+                return fail("Monitoring is still stopping; try again shortly.", error="stopping")
             return ok("Monitoring is already running.")
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="jarvis-monitor", daemon=True)
-        self._thread.start()
+        try:
+            self._thread.start()
+        except RuntimeError as e:
+            return fail("Couldn't start background monitoring.", error=str(e))
         return ok("Background monitoring on.")
 
     def stop(self) -> dict:
         self._stop.set()
+        if self.running and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2)
+        if self.running:
+            return fail("Monitoring is still stopping; a reading hasn't finished.", error="stopping")
         return ok("Background monitoring off.")
