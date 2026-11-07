@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import logging
+import math
 import os
 import re
 import signal
@@ -28,11 +29,12 @@ from pathlib import Path
 from typing import Callable
 
 from capabilities import (AppLauncher, BackgroundMonitor, FileSearch, Network, SystemMonitor,
-                          WebSearch, fmt_duration)
+                          WebSearch)
 from core import PROJECT_DIR, SETTABLE, Settings, config_home, fail, load_dotenv, ok, setup_logging, state_home
 from oslayer import PlatformBase, get_platform
 from personality import Personality
 from voice import Voice
+from workflows import Reminders, Routines, routine_name
 
 log = logging.getLogger("jarvis.main")
 __version__ = "0.1.0"
@@ -96,6 +98,8 @@ def split_commands(text: str, verbs: set[str] = CHAIN_VERBS) -> list[str]:
     if not text:
         return []
     body_cmd = re.compile(r"^(?:remind|notify|alert|send (?:me )?(?:a )?notification)\b", re.I)
+    if re.match(r"save routine\b", text, re.I) or body_cmd.match(text):
+        return [text]
     units: list[str] = []
     for part in re.split(r"\s*;\s*|,?\s+and then\s+|,?\s+then\s+", text, flags=re.I):
         if not part.strip():
@@ -115,12 +119,16 @@ def split_commands(text: str, verbs: set[str] = CHAIN_VERBS) -> list[str]:
 
 def parse_choice(text: str, n: int) -> int | None:
     """'2', 'the second one', 'option 3', 'last' -> 0-based index, or None."""
-    t = re.sub(r"\b(?:open|the|one|number|option|result|file|choice|app|#|please)\b", " ", text.lower())
+    t = re.sub(r"\b(?:open|the|number|option|result|file|choice|app|#|please)\b", " ", text.lower())
     t = t.strip(" .#")
     t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"\s+one$", "", t)
     if t == "last" and n:
         return n - 1
-    idx = int(t) if t.isdigit() else ORDINALS.get(t)
+    try:
+        idx = int(t) if t.isdecimal() else ORDINALS.get(t)
+    except ValueError:  # Python bounds very long decimal conversions too.
+        return None
     if idx is not None and 1 <= idx <= n:
         return idx - 1
     return None
@@ -161,7 +169,7 @@ class Router:
         t = re.sub(r"^(?:(?:please|kindly|can you|could you|would you|will you|i want you to|"
                    r"i need you to|go ahead and|just)\s+)+", "", t, flags=re.I)
         t = re.sub(r"\s+(?:please|for me)$", "", t, flags=re.I)
-        return t.strip()
+        return re.sub(r"[\s.!?,]+$", "", t)
 
     def match(self, text: str):
         for intent in self.intents:
@@ -198,7 +206,8 @@ class Router:
 # ── coordinator ────────────────────────────────────────────────────────────
 class Jarvis:
     def __init__(self, settings: Settings, platform: PlatformBase | None = None,
-                 voice: Voice | None = None, output: Callable[[str], None] | None = None):
+                 voice: Voice | None = None, output: Callable[[str], None] | None = None,
+                 state_dir: Path | None = None):
         self.settings = settings
         self.platform = platform or get_platform()
         self.name = str(settings.get("assistant_name") or "Jarvis")
@@ -218,14 +227,25 @@ class Jarvis:
         self.running = True
         self.pending: dict | None = None
         self.last_results: list[str] = []
-        self.reminders: list[dict] = []
+        state_dir = Path(state_dir) if state_dir is not None else state_home()
+        self.reminder_book = Reminders(state_dir / "reminders.json", self._reminder_due,
+                                       lambda message: self.output(f"[reminders] {message}"))
+        self.routines = Routines(state_dir / "routines.json")
         self._lock = threading.RLock()
         self._register_intents()
 
     # -- lifecycle ------------------------------------------------------
+    @property
+    def reminders(self):
+        return self.reminder_book.items()
+
     def start(self, voice_in: bool | None = None, voice_out: bool | None = None,
               greet: bool = True, monitor: bool = True) -> None:
-        threading.Thread(target=self.apps.index, name="jarvis-appindex", daemon=True).start()
+        try:
+            threading.Thread(target=self.apps.index, name="jarvis-appindex", daemon=True).start()
+        except RuntimeError:
+            log.exception("background app index failed to start")
+            self.output("App indexing will run when you first request an app.")
         want_out = self.settings.get("voice.output_enabled") if voice_out is None else voice_out
         want_in = self.settings.get("voice.input_enabled") if voice_in is None else voice_in
         if want_out:
@@ -238,12 +258,18 @@ class Jarvis:
             r = self.voice.set_input(True)
             self.output(r["text"] + ("" if r["ok"] else " Continuing with text input."))
         if monitor and self.settings.get("monitor.enabled"):
-            self.monitor.start()
+            result = self.monitor.start()
+            if not result["ok"]:
+                self.output(result["text"])
+        self.reminder_book.resume()
+        if self.routines.store.error:
+            self.output(self.routines.store.error)
 
     def shutdown(self) -> None:
+        self.running = False
         self.monitor.stop()
-        for rem in self.reminders:
-            rem["timer"].cancel()
+        self.reminder_book.shutdown()
+        self.routines.store.close()
         self.voice.shutdown()
         log.info("shutdown")
 
@@ -257,6 +283,8 @@ class Jarvis:
     def handle(self, text: str, source: str = "text") -> list[dict]:
         """Entry point for every input surface. Returns the results emitted."""
         with self._lock:
+            if not self.running:
+                return []
             text = (text or "").strip()
             if not text:
                 return []
@@ -266,7 +294,13 @@ class Jarvis:
                 self._emit(pending)
                 return [pending]
             results = []
-            for unit in split_commands(text):
+            norm = self.router.normalize(text)
+            routine = re.fullmatch(r"(?:run|show|delete)\s+routine\s+(.+)", norm, re.I)
+            if routine and not self.routines.store.error and routine.group(1).lower() in self.routines.store.data:
+                units = [norm]  # A saved name may itself contain "and" or "then".
+            else:
+                units = split_commands(norm or text)
+            for unit in units:
                 r = self.router.dispatch(unit)
                 self._emit(r)
                 results.append(r)
@@ -334,7 +368,7 @@ class Jarvis:
             return fail("Notifications are turned off in settings.", error="disabled")
         try:
             return self.platform.notify(title, body, urgency, app_name=str(self.settings.get("notifications.app_name")),
-                                        timeout_ms=int(self.settings.get("notifications.timeout_ms") or 6000))
+                                        timeout_ms=int(self.settings.get("notifications.timeout_ms")))
         except Exception as e:
             log.exception("notify failed")
             return fail("Notification failed.", error=str(e))
@@ -470,12 +504,23 @@ class Jarvis:
             self.h_reminder_list, 44, examples=("list reminders",))
         add("reminder_cancel", [r"(?:cancel|clear|delete|remove|stop)(?: all)?(?: my| the)? (?:reminders?|timers?)"],
             self.h_reminder_cancel, 44, examples=("cancel reminders",))
+        add("reminder_cancel_one", [r"(?:cancel|delete|remove) reminder (\d+)"],
+            lambda m: self.reminder_book.cancel(int(m.group(1))), 44)
+        add("remind_at", [r"remind me at (?P<when>\d{4}-\d{2}-\d{2} \d{2}:\d{2}) to (?P<what>.+)"],
+            self.h_remind_at, 44, examples=("remind me at 2026-11-20 09:00 to stretch",),
+            help="remind me at YYYY-MM-DD HH:MM to <message> · cancel reminder <number>")
         add("remind", [rf"remind me\s+(?:in|after)\s+(?P<amount>\S+)\s*(?P<unit>{UNITS})\s+(?:to|that|about)?\s*(?P<what>.+)",
                        rf"remind me\s+(?:to|that|about)\s+(?P<what>.+?)\s+(?:in|after)\s+(?P<amount>\S+)\s*(?P<unit>{UNITS})",
                        rf"(?:set (?:a |an )?)?timer\s+(?:for\s+)?(?P<amount>\S+)\s*(?P<unit>{UNITS})",
                        r"(?:set (?:a |an )?)?(?P<amount>\S+?)[\s-]*(?P<unit>second|sec|minute|min|hour|hr)s?\s+timer"],
             self.h_remind, 44, examples=("remind me in 10 minutes to stretch", "set a timer for 5 minutes"),
             help="remind me in 10 minutes to <x> · timer 5 minutes · list/cancel reminders")
+        add("routine_save", [r"save routine (?P<name>[^:]+):\s*(?P<commands>.+)"],
+            self.h_routine_save, 44, help="save routine <name>: <command>; <command>")
+        add("routine_list", [r"(?:list|show)(?: my)? routines"], self.h_routine_list, 44,
+            examples=("list routines",), help="list routines · show/run/delete routine <name>")
+        add("routine_action", [r"(run|show|delete) routine (.+)"], self.h_routine_action, 44,
+            examples=("run routine morning check",))
         add("notify", [r"(?:test|send a test) notification",
                        r"(?:notify me|notify|send (?:me )?(?:a )?notification|notification|alert me|pop ?up)"
                        r"(?:\s+(?:that|saying|about|with|to))?[\s:]+(.+)"],
@@ -581,7 +626,8 @@ class Jarvis:
     def h_voice_status(self, m) -> dict:
         s = self.voice.status()
         return ok(f"Voice output: {'on' if s['output'] else 'off'} (engine: {s['tts'] or 'none found'}). "
-                  f"Voice input: {'on' if s['input'] else 'off'} (recogniser: {s['stt']}).",
+                  f"Voice input: {'on' if s['input'] else 'off'} (recogniser: {s['stt']})."
+                  + (f" Last error: {s['error']}" if s.get("error") else ""),
                   speech=f"Voice output is {'on' if s['output'] else 'off'}, input is {'on' if s['input'] else 'off'}.")
 
     def h_remarks(self, m) -> dict:
@@ -628,15 +674,26 @@ class Jarvis:
             return fail(f"Unknown search engine '{value}'. Options: {', '.join(self.web.engines())}.", error="bad value")
         try:
             new = self.settings.set(key, value)
-        except (ValueError, KeyError) as e:
+        except (ValueError, KeyError, OverflowError) as e:
             return fail(f"Couldn't set {key}: {e}", error=str(e))
         if key == "web.search_engine":
             new = self.settings.set(key, self.web.canonical(value))
-        return ok(f"{key} = {new!r}. Say 'save settings' to keep it.", speech=f"Done. {key.split('.')[-1].replace('_', ' ')} set.")
+        if key == "voice.wake_word":
+            self.router.wake_words = [word.lower() for word in (self.name, new) if word]
+        hint = ""
+        if key in {"voice.stt_backend", "voice.mic_device_index", "voice.vosk_model_path", "voice.whisper_model"} \
+                and getattr(self.voice, "input_enabled", False):
+            self.voice.set_input(False)
+            hint = " Voice input stopped; say 'voice input on' to apply the change."
+        if key in {"voice.tts_backend", "voice.piper_model"} and self.voice.output_enabled:
+            self.voice.set_output(False)
+            hint = " Voice output stopped; say 'voice output on' to apply the change."
+        return ok(f"{key} = {new!r}. Say 'save settings' to keep it.{hint}",
+                  speech=f"Done. {key.split('.')[-1].replace('_', ' ')} set.{hint}")
 
     def h_system_status(self, m) -> dict:
         r = self.system.summary()
-        cpu = self.system.snapshot().get("cpu") if r["ok"] else None
+        cpu = r.get("data", {}).get("readings", {}).get("cpu", {}).get("percent")
         if cpu is not None and cpu > 85:
             quip = self.persona.remark("busy")
             if quip:
@@ -657,41 +714,99 @@ class Jarvis:
         amount, unit = g["amount"], g["unit"]
         what = (g.get("what") or "").strip() or "Timer finished."
         seconds = parse_duration(amount, unit)
-        if not seconds or seconds <= 0:
+        if not seconds or not math.isfinite(seconds) or seconds <= 0:
             return fail(f"I couldn't understand '{amount} {unit}'.", error="bad duration")
-        if seconds > 7 * 86400:
-            return fail("Keep it under a week — reminders only live while I'm running.", error="too long")
-        what = what.strip()
-        rem = {"text": what, "due": time.time() + seconds}
+        if seconds > 365 * 86400:
+            return fail("Set reminders within the next 365 days.", error="too long")
+        return self.reminder_book.add(what, time.time() + seconds)
 
-        def fire():
-            self.reminders[:] = [r for r in self.reminders if r is not rem]
-            msg = f"Reminder: {what}" if what != "Timer finished." else what
-            self.output(f"[reminder] {msg}")
-            self.notify(self.name, msg, "normal")
-            self.voice.say(msg)
+    def h_remind_at(self, m) -> dict:
+        try:
+            due = datetime.strptime(m.group("when"), "%Y-%m-%d %H:%M").timestamp()
+        except (ValueError, OverflowError, OSError):
+            return fail("Use a valid local date: YYYY-MM-DD HH:MM.", error="bad date")
+        if not 0 < due - time.time() <= 365 * 86400:
+            return fail("Choose a future date within the next 365 days.", error="bad date")
+        return self.reminder_book.add(m.group("what").strip(), due)
 
-        rem["timer"] = threading.Timer(seconds, fire)
-        rem["timer"].daemon = True
-        rem["timer"].start()
-        self.reminders.append(rem)
-        when = datetime.fromtimestamp(rem["due"]).strftime("%I:%M %p").lstrip("0")
-        return ok(f"Okay — in {fmt_duration(seconds) if seconds >= 60 else f'{int(seconds)} seconds'} ({when}): {what}",
-                  speech=f"Reminder set for {when}.")
+    def _reminder_due(self, item, missed):
+        msg = f"Reminder: {item['text']}"
+        if missed:
+            when = datetime.fromtimestamp(item["due"]).strftime("%Y-%m-%d %H:%M")
+            msg = f"Missed reminder ({when}): {item['text']}"
+        self.output(f"[reminder] {msg}")
+        self.notify(self.name, msg, "normal")
+        self.voice.say(msg)
 
     def h_reminder_list(self, m) -> dict:
+        if self.reminder_book.store.error:
+            return fail(self.reminder_book.store.error, error="unreadable state")
         if not self.reminders:
             return ok("No reminders pending.")
-        lines = [f"  {datetime.fromtimestamp(r['due']).strftime('%I:%M %p').lstrip('0')}  {r['text']}"
-                 for r in sorted(self.reminders, key=lambda r: r["due"])]
+        lines = [f"  {i}. {datetime.fromtimestamp(r['due']).strftime('%Y-%m-%d %H:%M')}  {r['text']}"
+                 for i, r in enumerate(self.reminders, 1)]
         return ok("Pending reminders:\n" + "\n".join(lines), speech=f"You have {len(lines)} pending.")
 
     def h_reminder_cancel(self, m) -> dict:
-        n = len(self.reminders)
-        for r in self.reminders:
-            r["timer"].cancel()
-        self.reminders.clear()
-        return ok(f"Cancelled {n} reminder{'s' * (n != 1)}.")
+        if m.group(0).lower().endswith(("reminder", "timer")):
+            return fail("Give a reminder number, for example 'cancel reminder 1', or say 'cancel all reminders'.")
+        return self.reminder_book.cancel()
+
+    def _routine_error(self, commands):
+        for command in commands:
+            if len(split_commands(command)) != 1:
+                return "A stored routine step must contain exactly one command."
+            intent, _ = self.router.match(self.router.normalize(command))
+            if intent is None or intent.name.startswith(("refuse_", "routine_")) or intent.name in {
+                    "exit", "stop", "unported"}:
+                return f"Unsupported routine step: {command}"
+        return None
+
+    def h_routine_save(self, m):
+        commands = []
+        for step in m.group("commands").split(";"):
+            commands.extend(split_commands(step))
+        error = self._routine_error(commands)
+        if error:
+            return fail(error, error="invalid routine")
+        return self.routines.save(m.group("name"), commands)
+
+    def h_routine_list(self, m):
+        if self.routines.store.error:
+            return fail(self.routines.store.error, error="unreadable state")
+        names = sorted(self.routines.store.data)
+        return ok("Routines:\n  " + "\n  ".join(names) if names else "No routines saved.")
+
+    def h_routine_action(self, m):
+        if self.routines.store.error:
+            return fail(self.routines.store.error, error="unreadable state")
+        action = m.group(1).lower()
+        try:
+            name = routine_name(m.group(2))
+        except ValueError as e:
+            return fail(str(e), error="invalid name")
+        commands = self.routines.store.data.get(name)
+        if commands is None:
+            return fail(f"No routine called '{name}'.", error="not_found")
+        if action == "delete":
+            return self.routines.delete(name)
+        if action == "show":
+            return ok(f"Routine '{name}':\n" + "\n".join(f"  {i}. {c}" for i, c in enumerate(commands, 1)))
+        error = self._routine_error(commands)
+        if error:
+            return fail(error, error="invalid routine")
+        steps = []
+        for command in commands:
+            result = self.router.dispatch(command)
+            steps.append({"command": command, "result": result})
+            if not result["ok"] or self.pending:
+                break
+        text = f"Routine '{name}':\n" + "\n".join(
+            f"  {i}. {s['command']}: {s['result']['text']}" for i, s in enumerate(steps, 1))
+        if not steps[-1]["result"]["ok"] or self.pending:
+            return fail(text + "\nRoutine stopped; remaining steps were skipped.",
+                        error=steps[-1]["result"].get("error") or "pending choice", steps=steps)
+        return ok(text, speech=f"Routine {name} completed.", steps=steps)
 
     def h_notify(self, m) -> dict:
         body = m.group(1) if m.lastindex else "Test notification — notifications are working."
@@ -758,10 +873,10 @@ class Jarvis:
         """Search, open the hit if it's unambiguous, otherwise list the matches."""
         r = self.files.search(query, kind=kind)
         results = r.get("data", {}).get("results") or []
-        exact = results and os.path.basename(results[0]).lower() in (
-            query.lower(), os.path.splitext(os.path.basename(results[0]))[0].lower())
-        if len(results) == 1 or exact:
-            return self.platform.open_path(results[0])
+        exact = [p for p in results if query.lower() == os.path.basename(p).lower() or
+                 (kind == "file" and query.lower() == os.path.splitext(os.path.basename(p))[0].lower())]
+        if not r.get("data", {}).get("truncated") and (len(results) == 1 or len(exact) == 1):
+            return self.platform.open_path(exact[0] if exact else results[0])
         self.last_results = results
         return r
 
@@ -813,7 +928,7 @@ def run_check(j: Jarvis, log_file) -> int:
     print(f"JARVIS {__version__} self-check")
     print(f"  python        {sys.version.split()[0]}  ({sys.executable})")
     print(f"  platform      {d.get('platform')}  desktop={d.get('desktop') or '-'}  session={d.get('session') or '-'}"
-          f"  display={d.get('display')}  root={d.get('root')}")
+          f"  display={d.get('display')}  dbus={d.get('dbus')}  root={d.get('root')}")
     print(f"  config        {j.settings.path} ({'exists' if j.settings.path.exists() else 'defaults only'})")
     print(f"  log file      {log_file or 'console only'}")
     for w in j.settings.warnings:
@@ -827,6 +942,8 @@ def run_check(j: Jarvis, log_file) -> int:
     print(f"  apps indexed  {len(j.apps.index())}")
     print(f"  tts engine    {v['tts'] or 'none (sudo apt install espeak-ng)'}")
     print(f"  stt           {v['stt']}")
+    for store in (j.reminder_book.store, j.routines.store):
+        print(f"  state         {store.path}: {store.error or 'ready'}")
     online = j.net.internet()[0]
     print(f"  internet      {'online' if online else 'offline'}")
     return 0
@@ -908,7 +1025,10 @@ def main(argv: list[str] | None = None) -> int:
 
     j = Jarvis(settings)
     if args.check:
-        return run_check(j, log_file)
+        try:
+            return run_check(j, log_file)
+        finally:
+            j.shutdown()
 
     voice_in = args.voice_in if args.voice_in is not None else args.voice
     voice_out = args.voice_out if args.voice_out is not None else args.voice
@@ -916,18 +1036,19 @@ def main(argv: list[str] | None = None) -> int:
     def _term(signum, frame):
         j.running = False
         raise KeyboardInterrupt
-    signal.signal(signal.SIGTERM, _term)
-
     try:
+        signal.signal(signal.SIGTERM, _term)
         if args.command:
             j.start(voice_in=False, voice_out=bool(voice_out), greet=False, monitor=False)
             results = []
             for c in args.command:
                 results += j.handle(c, source="cli")
+                if not j.running:
+                    break
             if j.voice.output_enabled:
                 j.wait_for_speech()
             if j.reminders:
-                print("(note: reminders only fire while Jarvis keeps running)", file=sys.stderr)
+                print("(reminders saved; keep Jarvis running to receive them on time, or restart to see missed reminders)", file=sys.stderr)
             return 0 if results and all(r.get("ok") for r in results) else 1
 
         j.start(voice_in=voice_in, voice_out=voice_out, greet=not args.no_greet)

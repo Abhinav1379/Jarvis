@@ -271,6 +271,8 @@ def _relevant_sources(
     core_terms = set(_keywords(query)).difference(_GENERIC_RESEARCH_TERMS)
     if not core_terms:
         core_terms = set(_keywords(query))
+    if not core_terms:
+        return list(sources[:max_results])
     minimum_overlap = 1 if len(core_terms) <= 2 else 2
     relevant: list[SearchSource] = []
     for source in sources:
@@ -481,7 +483,7 @@ _STOP_WORDS = {
 def _keywords(text: str) -> list[str]:
     return [
         token
-        for token in re.findall(r"[a-zA-Z0-9][a-zA-Z0-9'-]+", text.casefold())
+        for token in re.findall(r"[^\W_][^\W_'-]*(?:['-][^\W_]+)*", text.casefold())
         if token not in _STOP_WORDS and len(token) >= 2
     ]
 
