@@ -42,6 +42,7 @@ class AppEntry:
     keywords: tuple = field(default_factory=tuple)
     categories: tuple = field(default_factory=tuple)
     source: str = "desktop"
+    working_dir: str = ""
 
 
 class PlatformBase:

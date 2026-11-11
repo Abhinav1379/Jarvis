@@ -19,6 +19,7 @@ import struct
 import subprocess
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from core import fail, ok
 from oslayer import AppEntry, PlatformBase, is_privileged_exec
@@ -53,15 +54,15 @@ def _run(args: list[str], timeout: float = 8.0, env: dict | None = None) -> tupl
         return None, "", f"{args[0]} not found"
     except subprocess.TimeoutExpired:
         return None, "", f"{args[0]} timed out"
-    except OSError as e:
+    except (OSError, ValueError) as e:
         return None, "", str(e)
 
 
-def _spawn(args: list[str]) -> tuple[bool, str]:
+def _spawn(args: list[str], cwd: str | None = None) -> tuple[bool, str]:
     """Start a detached GUI process. Never raises."""
     try:
         subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True, cwd=cwd)
         return True, ""
     except (OSError, ValueError) as e:
         return False, str(e)
@@ -90,13 +91,16 @@ def exec_to_argv(exec_str: str, name: str = "", path: str = "") -> list[str]:
     try:
         tokens = shlex.split(exec_str)
     except ValueError:
-        tokens = exec_str.split()
+        return []
     argv = []
     for t in tokens:
+        t = t.replace("%%", "\x00")
+        if re.search(r"%(?![ckfFuUdDnNvmi])", t):
+            return []
         if t in FIELD_CODES:
             continue
-        t = t.replace("%c", name).replace("%k", path).replace("%%", "\x00")
-        t = re.sub(r"%[fFuUdDnNvmi]", "", t).replace("\x00", "%")
+        t = re.sub(r"%[ckfFuUdDnNvmi]", lambda m: {"%c": name, "%k": path}.get(m[0], ""), t)
+        t = t.replace("\x00", "%")
         if t:
             argv.append(t)
     return argv
@@ -125,6 +129,13 @@ def parse_desktop_file(path: str, desktop_id: str = "") -> AppEntry | None:
         return None
     if kv.get("NoDisplay", "").lower() == "true" or kv.get("Hidden", "").lower() == "true":
         return None
+    desktops = set(os.environ.get("XDG_CURRENT_DESKTOP", "").split(":")) - {""}
+    only = set(kv.get("OnlyShowIn", "").split(";")) - {""}
+    excluded = set(kv.get("NotShowIn", "").split(";")) - {""}
+    if (only and not desktops.intersection(only)) or desktops.intersection(excluded):
+        return None
+    if kv.get("TryExec") and not shutil.which(kv["TryExec"]):
+        return None
     if not kv.get("Name") or not kv.get("Exec"):
         return None
     split = lambda s: tuple(x.strip() for x in s.split(";") if x.strip())
@@ -132,7 +143,7 @@ def parse_desktop_file(path: str, desktop_id: str = "") -> AppEntry | None:
         name=kv["Name"], exec=kv["Exec"], desktop_id=desktop_id or os.path.basename(path),
         path=path, terminal=kv.get("Terminal", "").lower() == "true",
         generic_name=kv.get("GenericName", ""), keywords=split(kv.get("Keywords", "")),
-        categories=split(kv.get("Categories", "")), source="desktop")
+        categories=split(kv.get("Categories", "")), source="desktop", working_dir=kv.get("Path", ""))
 
 
 class LinuxPlatform(PlatformBase):
@@ -149,7 +160,7 @@ class LinuxPlatform(PlatformBase):
                     "Run me from a terminal inside the desktop.", error="DISPLAY/WAYLAND_DISPLAY unset")
 
     def diagnostics(self) -> dict:
-        tools = ["xdg-open", "gtk-launch", "gio", "notify-send", "nmcli", "iwgetid", "ip",
+        tools = ["xdg-open", "xdg-settings", "xdg-mime", "gtk-launch", "gio", "notify-send", "nmcli", "iwgetid", "ip",
                  "plocate", "locate", "loginctl", "xflock4", "xdg-screensaver",
                  "espeak-ng", "espeak", "spd-say", "piper", "aplay", "paplay", "pw-play"]
         return {
@@ -158,34 +169,44 @@ class LinuxPlatform(PlatformBase):
             "session": os.environ.get("XDG_SESSION_TYPE", ""),
             "display": self.has_display(),
             "dbus": bool(os.environ.get("DBUS_SESSION_BUS_ADDRESS")),
-            "root": os.geteuid() == 0,
+            "root": hasattr(os, "geteuid") and os.geteuid() == 0,
             "tools": {t: bool(shutil.which(t)) for t in tools},
         }
 
     # -- opening ------------------------------------------------------------
     def open_path(self, path: str) -> dict:
-        p = Path(path).expanduser()
+        p = Path(path).expanduser().absolute()
         if not p.exists():
             return fail(f"{p} doesn't exist.", error="missing path")
         if (err := self._need_display("open files")):
             return err
         for opener in (["xdg-open"], ["gio", "open"]):
             if shutil.which(opener[0]):
-                good, e = _spawn(opener + [str(p)])
-                if good:
+                rc, _, e = _run(opener + [str(p)], timeout=8)
+                if rc == 0:
                     return ok(f"Opened {p}", speech=f"Opening {p.name or p}.")
                 log.warning("open_path via %s failed: %s", opener[0], e)
-        return fail("I couldn't open that — xdg-open isn't available.", error="no opener")
+        return fail("Couldn't open that file. Install xdg-utils or use a working gio desktop session.", error="no working opener")
 
     def open_url(self, url: str) -> dict:
         if (err := self._need_display("open a browser")):
             return err
-        if shutil.which("xdg-open"):
-            good, e = _spawn(["xdg-open", url])
-            if good:
-                return ok(f"Opened {url}")
-            log.warning("xdg-open failed: %s", e)
-        return super().open_url(url)
+        try:
+            parsed = urlparse(url)
+            valid = (parsed.scheme.lower() in {"http", "https"} and parsed.hostname and
+                     not any(c.isspace() or ord(c) < 32 for c in url) and parsed.port != 0)
+        except ValueError:
+            valid = False
+        if not valid:
+            return fail("Only HTTP and HTTPS web addresses are supported.", error="invalid URL")
+        for opener in (["xdg-open"], ["gio", "open"]):
+            if shutil.which(opener[0]):
+                rc, _, err = _run(opener + [url], timeout=8)
+                if rc == 0:
+                    return ok(f"Opened {url}")
+                log.warning("browser opener %s failed: %s", opener[0], err)
+        return fail("Couldn't open a browser. Install xdg-utils or use a working gio desktop session.",
+                    error="no working opener")
 
     def user_dir(self, name: str) -> Path | None:
         name = name.lower().strip()
@@ -257,6 +278,11 @@ class LinuxPlatform(PlatformBase):
             return fail(f"{entry.name} needs elevated privileges; I won't launch it.", error="privileged")
         if (err := self._need_display("launch apps")):
             return err
+        argv = exec_to_argv(entry.exec, entry.name, entry.path)
+        if not argv:
+            return fail(f"{entry.name} has no usable launch command.", error="empty Exec")
+        if is_privileged_exec(shlex.join(argv)):
+            return fail(f"{entry.name} needs elevated privileges; I won't launch it.", error="privileged")
         # 1) gtk-launch / gio understand field codes, Terminal=true, DBus activation.
         if entry.desktop_id and entry.source == "desktop":
             if shutil.which("gtk-launch"):
@@ -275,9 +301,6 @@ class LinuxPlatform(PlatformBase):
                     return ok(f"Launched {entry.name}")
                 log.info("gio launch %s rc=%s %s", entry.path, rc, err)
         # 2) Parse Exec ourselves.
-        argv = exec_to_argv(entry.exec, entry.name, entry.path)
-        if not argv:
-            return fail(f"{entry.name} has no usable launch command.", error="empty Exec")
         if not shutil.which(argv[0]) and not os.path.isfile(argv[0]):
             return fail(f"{entry.name} seems to be uninstalled ({argv[0]} missing).", error="binary missing")
         if entry.terminal:
@@ -287,7 +310,7 @@ class LinuxPlatform(PlatformBase):
                     break
             else:
                 return fail(f"{entry.name} needs a terminal and I couldn't find one.", error="no terminal")
-        good, e = _spawn(argv)
+        good, e = _spawn(argv, cwd=entry.working_dir or None)
         return ok(f"Launched {entry.name}") if good else fail(f"Couldn't launch {entry.name}.", error=e)
 
     def locate(self, pattern: str, limit: int = 2000) -> list[str] | None:
@@ -305,22 +328,27 @@ class LinuxPlatform(PlatformBase):
     # -- notifications / session ---------------------------------------------
     def notify(self, title: str, body: str, urgency: str = "normal",
                app_name: str = "Jarvis", timeout_ms: int = 6000) -> dict:
+        if (err := self._need_display("show notifications")):
+            return err
         if not shutil.which("notify-send"):
             return fail("Desktop notifications need notify-send (package libnotify-bin).",
                         error="notify-send not found")
         urgency = urgency if urgency in ("low", "normal", "critical") else "normal"
         rc, _, err = _run(["notify-send", "-a", app_name, "-u", urgency, "-t", str(int(timeout_ms)),
-                           title, body], timeout=6)
+                           "--", title, body], timeout=6)
         if rc == 0:
             return ok("Notification sent.")
         return fail("The notification didn't go through.", error=err or f"rc={rc}")
 
     def lock_screen(self) -> dict:
+        if (err := self._need_display("lock the screen")):
+            return err
         desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
         attempts = []
         if "xfce" in desktop:
             attempts.append(["xflock4"])
-        attempts += [["loginctl", "lock-session"], ["xdg-screensaver", "lock"],
+        session = os.environ.get("XDG_SESSION_ID")
+        attempts += [["loginctl", "lock-session"] + ([session] if session else []), ["xdg-screensaver", "lock"],
                      ["gnome-screensaver-command", "-l"], ["dm-tool", "lock"]]
         tried = []
         for cmd in attempts:
@@ -338,8 +366,11 @@ class LinuxPlatform(PlatformBase):
         first = _read("/proc/stat").split("\n", 1)[0].split()
         if not first or first[0] != "cpu":
             return None
-        vals = [int(v) for v in first[1:9]]
-        idle = vals[3] + vals[4]
+        try:
+            vals = [int(v) for v in first[1:9]]
+            idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+        except (ValueError, IndexError):
+            return None
         return idle, sum(vals)
 
     def cpu_stats(self) -> dict | None:
@@ -381,18 +412,22 @@ class LinuxPlatform(PlatformBase):
         batteries, ac_online = [], None
         for dev in sorted(glob.glob("/sys/class/power_supply/*")):
             typ = _read(f"{dev}/type")
-            if typ == "Mains":
-                ac_online = _read(f"{dev}/online") == "1" or bool(ac_online)
-            elif typ == "Battery" and _read(f"{dev}/present", "1") == "1":
+            if typ != "Battery":
+                online = _read(f"{dev}/online")
+                if online in ("0", "1"):
+                    ac_online = online == "1" or bool(ac_online)
+            elif _read(f"{dev}/present", "1") == "1":
                 cap = _read(f"{dev}/capacity")
                 if not cap.isdigit():
                     continue
                 status = _read(f"{dev}/status", "Unknown")
                 secs = None
-                e_now = _read(f"{dev}/energy_now") or _read(f"{dev}/charge_now")
-                p_now = _read(f"{dev}/power_now") or _read(f"{dev}/current_now")
-                if status == "Discharging" and e_now.isdigit() and p_now.isdigit() and int(p_now) > 0:
-                    secs = int(3600 * int(e_now) / int(p_now))
+                if status == "Discharging":
+                    for energy, rate in (("energy_now", "power_now"), ("charge_now", "current_now")):
+                        e_now, p_now = _read(f"{dev}/{energy}"), _read(f"{dev}/{rate}")
+                        if e_now.isdigit() and p_now.isdigit() and int(p_now) > 0:
+                            secs = int(3600 * int(e_now) / int(p_now))
+                            break
                 batteries.append({"name": os.path.basename(dev), "percent": int(cap),
                                   "status": status, "seconds_left": secs})
         if not batteries:
@@ -445,7 +480,7 @@ class LinuxPlatform(PlatformBase):
         return procs[:n]
 
     # -- network -----------------------------------------------------------------
-    def network_interfaces(self) -> list[dict] | None:
+    def _network_devices(self) -> list[dict]:
         ifaces = []
         for dev in sorted(glob.glob("/sys/class/net/*")):
             name = os.path.basename(dev)
@@ -455,6 +490,10 @@ class LinuxPlatform(PlatformBase):
             is_virtual = os.path.realpath(dev).startswith("/sys/devices/virtual/")
             ifaces.append({"name": name, "state": _read(f"{dev}/operstate", "unknown"),
                            "wireless": wireless, "virtual": is_virtual, "ipv4": []})
+        return ifaces
+
+    def network_interfaces(self) -> list[dict] | None:
+        ifaces = self._network_devices()
         if shutil.which("ip"):
             rc, out, _ = _run(["ip", "-j", "-4", "addr"], timeout=4)
             if rc == 0:
@@ -464,7 +503,7 @@ class LinuxPlatform(PlatformBase):
                         tgt = by_name.get(item.get("ifname"))
                         if tgt is not None:
                             tgt["ipv4"] = [a["local"] for a in item.get("addr_info", []) if "local" in a]
-                except (ValueError, KeyError, TypeError) as e:
+                except (ValueError, KeyError, TypeError, AttributeError) as e:
                     log.debug("ip -j parse failed: %s", e)
         return ifaces
 
@@ -479,15 +518,17 @@ class LinuxPlatform(PlatformBase):
         return None
 
     def wifi_status(self) -> dict | None:
-        ifaces = self.network_interfaces() or []
+        ifaces = self._network_devices()
         wlan = [i for i in ifaces if i["wireless"]]
         status = {"adapter": bool(wlan), "device": wlan[0]["name"] if wlan else None,
                   "enabled": None, "ssid": None, "signal": None, "security": None, "tool": None}
         if shutil.which("nmcli"):
             status["tool"] = "nmcli"
             rc, out, _ = _run(["nmcli", "-t", "-f", "WIFI", "general"], timeout=5)
-            if rc == 0 and out.strip():
+            if rc == 0 and out.strip().lower() in ("enabled", "disabled"):
                 status["enabled"] = out.strip().lower() == "enabled"
+            if status["enabled"] is False:
+                return status
             rc, out, _ = _run(["nmcli", "-t", "-f", "ACTIVE,SSID,SIGNAL,SECURITY",
                                "device", "wifi", "list", "--rescan", "no"], timeout=8)
             if rc == 0:
@@ -497,7 +538,7 @@ class LinuxPlatform(PlatformBase):
                         status.update(ssid=f[1] or "(hidden)", security=f[3] or "open",
                                       signal=int(f[2]) if f[2].isdigit() else None)
                         break
-            return status
+                return status
         if shutil.which("iwgetid"):
             status["tool"] = "iwgetid"
             rc, out, _ = _run(["iwgetid", "-r"], timeout=4)
