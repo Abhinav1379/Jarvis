@@ -15,8 +15,11 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import os
+import re
 import sys
+import tempfile
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -145,6 +148,10 @@ SETTABLE = (
     "voice.wake_word",
     "voice.require_wake_word",
     "voice.phrase_time_limit",
+    "voice.mic_device_index",
+    "voice.vosk_model_path",
+    "voice.whisper_model",
+    "voice.piper_model",
     "files.max_results",
     "files.include_hidden",
     "web.search_engine",
@@ -159,17 +166,48 @@ _TRUE = {"1", "true", "yes", "on", "y", "enabled"}
 _FALSE = {"0", "false", "no", "off", "n", "disabled"}
 
 
+def validate_setting(key: str, value) -> None:
+    ranges = {"voice.tts_rate": (80, 450), "voice.mic_device_index": (-1, 1024),
+              "voice.phrase_time_limit": (1, 60), "monitor.interval_s": (5, 86400),
+              "monitor.cpu_sustain_checks": (1, 1000), "personality.remark_chance": (0, 1),
+              "files.max_results": (1, 1000), "files.max_depth": (0, 100),
+              "files.time_budget_s": (0.01, 300), "network.timeout_s": (0.1, 60),
+              "notifications.timeout_ms": (0, 600000), "logging.max_bytes": (1, 1000000000),
+              "logging.backups": (0, 100)}
+    if key.startswith("monitor.") and key.split(".")[-1] in {
+            "battery_low", "battery_critical", "battery_high", "ram_high", "cpu_high", "disk_low_free_pct"}:
+        ranges[key] = (0, 100)
+    if key in ranges:
+        lo, hi = ranges[key]
+        if not math.isfinite(value) or not lo <= value <= hi:
+            raise ValueError(f"{key} must be between {lo} and {hi}")
+    backends = {"voice.stt_backend": {"google", "vosk", "whisper"},
+                "voice.tts_backend": {"auto", "piper", "espeak-ng", "espeak", "spd-say", "pyttsx3"}}
+    if key in backends and value not in backends[key]:
+        raise ValueError(f"{key} must be one of {', '.join(sorted(backends[key]))}")
+    if isinstance(value, list) and any(not isinstance(v, str) or not v.strip() for v in value):
+        raise ValueError(f"{key} must contain nonempty strings")
+    if key in {"apps.aliases", "web.engines"} and any(
+            not isinstance(k, str) or not k.strip() or not isinstance(v, str) or not v.strip()
+            for k, v in value.items()):
+        raise ValueError(f"{key} must map nonempty names to strings")
+    if key in {"logging.level", "logging.console_level"} and value.upper() not in {
+            "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "NOTSET"}:
+        raise ValueError(f"{key} is not a logging level")
+
+
 def coerce(value, like):
     """Convert `value` (usually a str) to the type of `like`. Raises ValueError."""
     if not isinstance(value, str):
         if isinstance(like, bool) and isinstance(value, bool):
             return value
-        if isinstance(like, (int, float)) and not isinstance(like, bool) and isinstance(value, (int, float)):
+        if isinstance(like, (int, float)) and not isinstance(like, bool) and \
+                isinstance(value, (int, float)) and not isinstance(value, bool):
+            if not math.isfinite(value) or (isinstance(like, int) and value != int(value)):
+                raise ValueError("expected a finite number without a fractional integer part")
             return type(like)(value)
         if isinstance(like, (list, dict)) and isinstance(value, type(like)):
             return value
-        if isinstance(like, str):
-            return str(value)
         raise ValueError(f"expected {type(like).__name__}, got {type(value).__name__}")
     v = value.strip()
     if isinstance(like, bool):
@@ -179,15 +217,27 @@ def coerce(value, like):
             return False
         raise ValueError(f"'{value}' is not a yes/no value")
     if isinstance(like, int):
-        return int(float(v))
+        number = float(v)
+        if not math.isfinite(number) or not number.is_integer():
+            raise ValueError("expected a finite integer")
+        return int(v) if re.fullmatch(r"[+-]?\d+", v) else int(number)
     if isinstance(like, float):
-        return float(v)
+        number = float(v)
+        if not math.isfinite(number):
+            raise ValueError("expected a finite number")
+        return number
     if isinstance(like, list):
         if v.startswith("["):
-            return list(json.loads(v))
+            value = json.loads(v)
+            if not isinstance(value, list):
+                raise ValueError("expected a list")
+            return value
         return [p.strip() for p in v.split(",") if p.strip()]
     if isinstance(like, dict):
-        return dict(json.loads(v))
+        value = json.loads(v)
+        if not isinstance(value, dict):
+            raise ValueError("expected an object")
+        return value
     return v
 
 
@@ -213,7 +263,9 @@ def _put(d: dict, dotted: str, value) -> None:
     parts = dotted.split(".")
     cur = d
     for part in parts[:-1]:
-        cur = cur.setdefault(part, {})
+        if not isinstance(cur.get(part), dict):
+            cur[part] = {}
+        cur = cur[part]
     cur[parts[-1]] = value
 
 
@@ -223,7 +275,7 @@ def load_dotenv(path: Path, env: dict | None = None) -> int:
     count = 0
     try:
         lines = Path(path).read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except (OSError, UnicodeError):
         return 0
     for line in lines:
         line = line.strip()
@@ -245,6 +297,27 @@ class Settings:
         self.path = Path(path) if path else config_home() / "config.json"
         self.file_data = copy.deepcopy(file_data or {})
         self.warnings: list[str] = []
+        self.load_error: str | None = None
+        for section, defaults in DEFAULTS.items():
+            if not isinstance(defaults, dict):
+                try:
+                    self.data[section] = coerce(self.data[section], defaults)
+                except (ValueError, TypeError, OverflowError) as e:
+                    self.warnings.append(f"Ignoring {section}: {e}")
+                    self.data[section] = copy.deepcopy(defaults)
+                continue
+            if not isinstance(self.data.get(section), dict):
+                self.warnings.append(f"Ignoring invalid {section} settings; expected an object")
+                self.data[section] = copy.deepcopy(DEFAULTS[section])
+            for name, default in defaults.items():
+                key = f"{section}.{name}"
+                try:
+                    value = coerce(self.data[section][name], default)
+                    validate_setting(key, value)
+                    self.data[section][name] = value
+                except (ValueError, TypeError, OverflowError) as e:
+                    self.warnings.append(f"Ignoring {key}: {e}")
+                    self.data[section][name] = copy.deepcopy(default)
 
     # -- loading --------------------------------------------------------
     @staticmethod
@@ -264,16 +337,17 @@ class Settings:
         cfg_path = Path(path).expanduser() if path else cls.find_config(None, env)
         file_data: dict = {}
         warnings = []
-        if cfg_path.exists():
-            try:
-                file_data = json.loads(cfg_path.read_text(encoding="utf-8")) or {}
+        try:
+            if cfg_path.exists():
+                file_data = json.loads(cfg_path.read_text(encoding="utf-8"))
                 if not isinstance(file_data, dict):
                     raise ValueError("top level must be an object")
-            except (OSError, ValueError) as e:
-                warnings.append(f"Ignoring unreadable config {cfg_path}: {e}")
-                file_data = {}
-        s = cls(file_data, cfg_path, file_data)
+            s = cls(file_data, cfg_path, file_data)
+        except (OSError, ValueError, RecursionError) as e:
+            warnings.append(f"Ignoring unreadable config {cfg_path}: {e}")
+            s = cls({}, cfg_path, {})
         s.warnings.extend(warnings)
+        s.load_error = warnings[0] if warnings else None
         s._apply_env(env)
         return s
 
@@ -287,8 +361,10 @@ class Settings:
             except KeyError:
                 continue
             try:
-                _put(self.data, dotted, coerce(raw, like))
-            except (ValueError, json.JSONDecodeError) as e:
+                value = coerce(raw, like)
+                validate_setting(dotted, value)
+                _put(self.data, dotted, value)
+            except (ValueError, OverflowError, RecursionError) as e:
                 self.warnings.append(f"Ignoring {key}: {e}")
 
     # -- access ---------------------------------------------------------
@@ -302,6 +378,7 @@ class Settings:
         """Set a known key, coercing to the default's type. Returns the new value."""
         like = _dig(DEFAULTS, dotted)            # KeyError for unknown keys
         new = coerce(value, like)
+        validate_setting(dotted, new)
         _put(self.data, dotted, new)
         if persist:
             _put(self.file_data, dotted, new)
@@ -326,14 +403,29 @@ class Settings:
         return hits[0] if len(hits) == 1 else None
 
     def save(self) -> dict:
+        if self.load_error:
+            return fail(f"{self.load_error}. Repair or move that file before saving settings.", error="unreadable config")
+        tmp = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.file_data, indent=2) + "\n", encoding="utf-8")
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent,
+                                             prefix=self.path.name, suffix=".tmp", delete=False) as f:
+                tmp = Path(f.name)
+                os.chmod(tmp, 0o600)
+                json.dump(self.file_data, f, indent=2, allow_nan=False)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
             tmp.replace(self.path)
             return ok(f"Settings saved to {self.path}.", speech="Settings saved.")
-        except OSError as e:
+        except (OSError, ValueError) as e:
             return fail(f"Couldn't save settings to {self.path}.", error=str(e))
+        finally:
+            if tmp and tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    log.warning("Couldn't remove temporary settings file %s", tmp)
 
 
 # ── logging ───────────────────────────────────────────────────────────────
